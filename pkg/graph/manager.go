@@ -19,12 +19,91 @@ package graph
 import (
 	"fmt"
 	gb "go/build"
-	// "log"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/fsnotify/fsnotify"
 )
+
+// New creates a new Interface for building up dependency graphs.
+// It starts in the provided working directory, and will call the provided
+// Observer for any changes.
+//
+// The returned graph is empty, but new targets may be added via the returned
+// Interface.  New also returns any immediate errors, and a channel through which
+// errors watching for changes in the dependencies will be returned until the
+// graph is Shutdown.
+//   // Create our empty graph
+//   g, errCh, err := New(...)
+//   if err != nil { ... }
+//   // Cleanup when we're done.  This closes errCh.
+//   defer g.Shutdown()
+//   // Start tracking this target.
+//   err := g.Add("github.com/mattmoor/warm-image/cmd/controller")
+//   if err != nil { ... }
+//   select {
+//     case err := <- errCh:
+//       // Handle errors that occur while watching the above target.
+//     case <-stopCh:
+//       // When some stop signal happens, we're done.
+//   }
+func New(obs Observer) (Interface, chan error, error) {
+	return NewWithOptions(obs, DefaultOptions...)
+}
+
+var DefaultOptions = []Option{WithCurrentDirectory, WithContext(&gb.Default), WithFSNotify,
+	WithFileFilter(OmitTest, OmitNonGo), WithPackageFilter(OmitVendor), WithOutsideWorkDirFilter}
+
+func NewWithOptions(obs Observer, opts ...Option) (Interface, chan error, error) {
+	m := &manager{
+		packages: make(map[string]*node),
+	}
+
+	for _, opt := range opts {
+		if err := opt(m); err != nil {
+			if m.watcher != nil {
+				m.watcher.Close()
+			}
+			return nil, nil, err
+		}
+	}
+
+	// Start listening for events via the filesystem watcher.
+	go func() {
+		for {
+			event, ok := <-m.eventCh
+			if !ok {
+				// When the channel has been closed, the watcher is shutting down
+				// and we should return to cleanup the go routine.
+				return
+			}
+
+			// Apply our file filters to improve the signal-to-noise.
+			skip := false
+			for _, f := range m.fileFilters {
+				if f(event.Name) {
+					skip = true
+				}
+			}
+			if skip {
+				continue
+			}
+
+			// Determine what package contains this file
+			// and signal the change.  Call our Observer
+			// on affected targets when we're done.
+			if n := m.enclosingPackage(event.Name); n != nil {
+				m.onChange(n, func(n *node) {
+					obs(m.affectedTargets(n))
+				})
+			}
+		}
+	}()
+
+	return m, m.errCh, nil
+}
 
 // notification is a callback that internal consumers of manager may use to get
 // a crack at a node after it has been updated.
@@ -33,22 +112,28 @@ type notification func(*node)
 // empty implements notification and does nothing.
 func empty(n *node) {}
 
+type watcher interface {
+	Add(string) error
+	Remove(string) error
+	Close() error
+}
+
 type manager struct {
 	m sync.Mutex
 
-	pkgFilters []PackageFilter
+	ctx *gb.Context
+
+	pkgFilters  []PackageFilter
+	fileFilters []FileFilter
 
 	packages map[string]*node
-	watcher  interface {
-		Add(string) error
-		Remove(string) error
-		Close() error
-	}
+	watcher  watcher
 
 	// The working directory relative to which import paths are evaluated.
 	workdir string
 
-	errCh chan error
+	errCh   chan error
+	eventCh chan fsnotify.Event
 }
 
 // manager implements Interface
@@ -73,7 +158,7 @@ func (m *manager) Add(importpath string) error {
 func (m *manager) add(importpath string, dependent *node) (*node, bool, error) {
 	// INVARIANT m.m must be held to call this.
 	if pkg, ok := m.packages[importpath]; ok {
-		return pkg, m.addDependent(pkg, dependent), nil
+		return pkg, pkg.addDependent(dependent), nil
 	}
 
 	// New nodes always start as a simple shell, then we set up the
@@ -86,17 +171,19 @@ func (m *manager) add(importpath string, dependent *node) (*node, bool, error) {
 		name: importpath,
 	}
 	m.packages[importpath] = newNode
-	m.addDependent(newNode, dependent)
+	newNode.addDependent(dependent)
 
 	// Load the package once to determine it's filesystem location,
 	// and set up a watch on that location.
-	pkg, err := gb.Import(importpath, m.workdir, gb.ImportComment)
+	pkg, err := m.ctx.Import(importpath, m.workdir, gb.ImportComment)
 	if err != nil {
-		// TODO(mattmoor): Cleanup newNode?
+		newNode.removeDependent(dependent)
+		delete(m.packages, importpath)
 		return nil, false, err
 	}
 	if err := m.watcher.Add(pkg.Dir); err != nil {
-		// TODO(mattmoor): Cleanup newNode?
+		newNode.removeDependent(dependent)
+		delete(m.packages, importpath)
 		return nil, false, err
 	}
 
@@ -106,44 +193,6 @@ func (m *manager) add(importpath string, dependent *node) (*node, bool, error) {
 	return newNode, true, nil
 }
 
-// addDependent adds the given dependent to the list of dependents for
-// the given dependency.  Dependent may be nil.
-// This returns whether the node's neighborhood changes.
-// The manager's lock must be held before calling this.
-func (m *manager) addDependent(dependency, dependent *node) bool {
-	if dependent == nil {
-		return false
-	}
-
-	for _, depdnt := range dependency.dependents {
-		if depdnt == dependent {
-			// Already a dependent
-			return false
-		}
-	}
-
-	// log.Printf("Adding %s <- %s", dependent.name, dependency.name)
-	dependency.dependents = append(dependency.dependents, dependent)
-	return true
-}
-
-// addDependency adds the given dependency to the list of dependencies for
-// the given dependent.  Neither parameter may be nil.
-// This returns whether the node's neighborhood changes.
-// The manager's lock must be held before calling this.
-func (m *manager) addDependency(dependent, dependency *node) bool {
-	for _, depdcy := range dependent.dependencies {
-		if depdcy == dependency {
-			// Already a dependency
-			return false
-		}
-	}
-
-	// log.Printf("Adding %s -> %s", dependent.name, dependency.name)
-	dependent.dependencies = append(dependent.dependencies, dependency)
-	return true
-}
-
 // affectedTargets returns the set of targets that would be affected by a
 // change to the target represented by the given node.  This set is comprised
 // of the transitive dependents of the node, including itself.
@@ -151,25 +200,7 @@ func (m *manager) affectedTargets(n *node) StringSet {
 	m.m.Lock()
 	defer m.m.Unlock()
 
-	// We will use "set" as the visited group for our DFS.
-	set := make(StringSet)
-	queue := []*node{n}
-
-	for len(queue) != 0 {
-		// Pop the top element off of the queue.
-		top := queue[len(queue)-1]
-		queue = queue[:len(queue)-1]
-		// Check/Mark visited
-		if set.Has(top.name) {
-			continue
-		}
-		set.Add(top.name)
-
-		// Append this node's dependents to our search.
-		queue = append(queue, top.dependents...)
-	}
-
-	return set
+	return n.transitiveDependents()
 }
 
 // enclosingPackage returns the node for the package covering the
@@ -195,19 +226,20 @@ func (m *manager) onChange(changed *node, not notification) {
 	defer m.m.Unlock()
 
 	// Load the package information and update dependencies.
-	pkg, err := gb.Import(changed.name, m.workdir, gb.ImportComment)
+	pkg, err := m.ctx.Import(changed.name, m.workdir, gb.ImportComment)
 	if err != nil {
 		m.errCh <- err
 		return
 	}
 
 	// haveDepsChanged := false
+	seen := make(StringSet)
 	for _, ip := range pkg.Imports {
 		if ip == "C" {
 			// skip cgo
 			continue
 		}
-		subpkg, err := gb.Import(ip, m.workdir, gb.ImportComment)
+		subpkg, err := m.ctx.Import(ip, m.workdir, gb.ImportComment)
 		if err != nil {
 			m.errCh <- err
 			return
@@ -223,18 +255,6 @@ func (m *manager) onChange(changed *node, not notification) {
 		if skip {
 			continue
 		}
-
-		// // TODO(mattmoor): Create a way to pass in filters instead
-		// // of hardcoding these.
-		// if !strings.HasPrefix(subpkg.Dir, m.workdir) {
-		// 	// Skip import paths outside of our workspace (std library)
-		// 	continue
-		// }
-		// if strings.Contains(subpkg.ImportPath, "/vendor/") {
-		// 	// Skip vendor dependencies.
-		// 	continue
-		// }
-
 		n, chg, err := m.add(subpkg.ImportPath, changed)
 		if err != nil {
 			m.errCh <- err
@@ -242,17 +262,59 @@ func (m *manager) onChange(changed *node, not notification) {
 		} else if chg {
 			// haveDepsChanged = true
 		}
-		if m.addDependency(changed, n) {
+		if changed.addDependency(n) {
 			// haveDepsChanged = true
 		}
+		seen.Add(subpkg.ImportPath)
 	}
 
-	// TODO(mattmoor): Remove dependencies that we no longer have.
+	// Remove dependencies that we no longer have.
+	removed := changed.removeUnseenDependencies(seen)
+	if len(removed) > 0 {
+		// haveDepsChanged = true
+	}
+	for _, dependency := range removed {
+		d := dependency
+		go m.maybeGC(d)
+	}
 
 	// log.Printf("Processing %s, have deps changed: %v", changed.name, haveDepsChanged)
 	// Done via go routine so that we can be passed a callback that
 	// takes the lock on manager.
 	go not(changed)
+}
+
+func (m *manager) maybeGC(n *node) {
+	m.m.Lock()
+	defer m.m.Unlock()
+
+	if len(n.dependents) > 0 {
+		// It has dependents, so it should not be removed.
+		return
+	}
+
+	// If it has zero dependents, then remove it from the packages map.
+	delete(m.packages, n.name)
+
+	// Lookup the package information, so that we know what directory to stop watching.
+	subpkg, err := m.ctx.Import(n.name, m.workdir, gb.ImportComment)
+	if err != nil {
+		m.errCh <- err
+		return
+	}
+
+	// Remove the watch on the package's directory
+	if err := m.watcher.Remove(subpkg.Dir); err != nil {
+		m.errCh <- err
+		return
+	}
+
+	for _, dependency := range n.dependencies {
+		dependency.removeDependent(n)
+
+		d := dependency
+		go m.maybeGC(d)
+	}
 }
 
 // Shutdown implements Interface.

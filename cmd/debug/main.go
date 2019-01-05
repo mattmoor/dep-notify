@@ -18,20 +18,16 @@ package main
 
 import (
 	"log"
-	"os"
 	"time"
 
 	"github.com/mattmoor/dep-notify/pkg/graph"
 )
 
 func main() {
-	// Assume we're invoked from the current directory.
-	wd, _ := os.Getwd()
-
 	// Create a new empty graph that simply enumerates the affected
 	// targets (import paths) when a file in a tracked directory
 	// changes.
-	m, errCh, err := graph.New(wd, func(ss graph.StringSet) {
+	m, errCh, err := graph.New(func(ss graph.StringSet) {
 		log.Printf("Affected targets: %v", ss.InOrder())
 	})
 	if err != nil {

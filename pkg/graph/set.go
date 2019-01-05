@@ -28,6 +28,11 @@ func (ss *StringSet) Add(key string) {
 	(*ss)[key] = struct{}{}
 }
 
+// Remove deletes a provided key from our set.
+func (ss *StringSet) Remove(key string) {
+	delete(*ss, key)
+}
+
 // Has returns whether the set contains the provided key.
 func (ss *StringSet) Has(key string) bool {
 	_, ok := (*ss)[key]
