@@ -23,9 +23,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
+
+const defaultDebounce = 100 * time.Millisecond
 
 // New creates a new Interface for building up dependency graphs.
 // It starts in the provided working directory, and will call the provided
@@ -53,8 +56,15 @@ func New(obs Observer) (Interface, chan error, error) {
 	return NewWithOptions(obs, DefaultOptions...)
 }
 
-var DefaultOptions = []Option{WithCurrentDirectory, WithContext(&gb.Default), WithFSNotify,
-	WithFileFilter(OmitTest, OmitNonGo), WithPackageFilter(OmitVendor), WithOutsideWorkDirFilter}
+var DefaultOptions = []Option{
+	WithCurrentDirectory,
+	WithContext(&gb.Default),
+	WithFSNotify,
+	WithFileFilter(OmitTest, OmitNonGo),
+	WithPackageFilter(OmitVendor),
+	WithOutsideWorkDirFilter,
+	WithDebounce(defaultDebounce),
+}
 
 func NewWithOptions(obs Observer, opts ...Option) (Interface, chan error, error) {
 	m := &manager{
@@ -69,6 +79,9 @@ func NewWithOptions(obs Observer, opts ...Option) (Interface, chan error, error)
 			return nil, nil, err
 		}
 	}
+
+	// Debounce the events from eventCh.
+	timers := make(map[string]*time.Timer)
 
 	// Start listening for events via the filesystem watcher.
 	go func() {
@@ -91,12 +104,19 @@ func NewWithOptions(obs Observer, opts ...Option) (Interface, chan error, error)
 				continue
 			}
 
-			// Determine what package contains this file
-			// and signal the change.  Call our Observer
-			// on affected targets when we're done.
-			if n := m.enclosingPackage(event.Name); n != nil {
-				m.onChange(n, func(n *node) {
-					obs(m.affectedTargets(n))
+			if t, ok := timers[event.Name]; ok {
+				// Postpone any unfired events.
+				t.Reset(m.debounce)
+			} else {
+				timers[event.Name] = time.AfterFunc(m.debounce, func() {
+					// Determine what package contains this file
+					// and signal the change.  Call our Observer
+					// on affected targets when we're done.
+					if n := m.enclosingPackage(event.Name); n != nil {
+						m.onChange(n, func(n *node) {
+							obs(m.affectedTargets(n))
+						})
+					}
 				})
 			}
 		}
@@ -134,6 +154,8 @@ type manager struct {
 
 	errCh   chan error
 	eventCh chan fsnotify.Event
+
+	debounce time.Duration
 }
 
 // manager implements Interface

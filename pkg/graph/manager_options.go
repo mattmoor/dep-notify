@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -116,4 +117,12 @@ func WithOutsideWorkDirFilter(m *manager) error {
 		return !strings.HasPrefix(pkg.Dir, m.workdir)
 	})
 	return nil
+}
+
+// WithDebounce configures the graph to debounce events by duration.
+func WithDebounce(debounce time.Duration) Option {
+	return func(m *manager) error {
+		m.debounce = debounce
+		return nil
+	}
 }
