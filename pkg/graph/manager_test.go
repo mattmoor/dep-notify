@@ -612,11 +612,21 @@ func Echo() {
 		t.Errorf("writeFilesToGOPATH() = %v", err)
 	}
 
-	// Sleep because we build things up asynchronously.
-	time.Sleep(100 * time.Millisecond)
+	if err := writeFilesToGOPATH(workdir, newfiles); err != nil {
+		t.Errorf("writeFilesToGOPATH() = %v", err)
+	}
 
-	if called == 0 {
-		t.Error("Wanted the observer to get called, but saw no calls")
+	// Sleep because we build things up asynchronously.
+	time.Sleep(50 * time.Millisecond)
+
+	if called != 0 {
+		t.Error("Expected events to get debounced")
+	}
+
+	time.Sleep(defaultDebounce)
+
+	if called != 1 {
+		t.Errorf("Wanted the observer to get called once, but saw %d calls", called)
 	}
 
 	morenewfiles := map[string]string{
