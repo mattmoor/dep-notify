@@ -57,8 +57,10 @@ func main() {
 	}
 
 	// Listen for errors.
-	select {
-	case err := <-errCh:
-		log.Fatalf("ERROR: %v", err)
+	for {
+		select {
+		case err := <-errCh:
+			log.Printf("ERROR: %v", err)
+		}
 	}
 }
